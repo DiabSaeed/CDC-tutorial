@@ -1,0 +1,422 @@
+services:
+
+  # ============================================================
+  # PostgreSQL - Source Database
+  # ============================================================
+
+  postgres:
+    image: postgres:15
+    container_name: cdc-postgres
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ecommerce
+
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # Kafka - KRaft
+  # ============================================================
+
+  kafka:
+    image: apache/kafka:4.0.0
+    container_name: cdc-kafka
+
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+    ports:
+      - "9092:9092"
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # Debezium Kafka Connect
+  # ============================================================
+
+  debezium:
+    image: quay.io/debezium/connect:2.7
+    container_name: cdc-debezium
+
+    depends_on:
+      - kafka
+      - postgres
+
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+
+      GROUP_ID: 1
+
+      CONFIG_STORAGE_TOPIC: debezium_connect_configs
+      OFFSET_STORAGE_TOPIC: debezium_connect_offsets
+      STATUS_STORAGE_TOPIC: debezium_connect_status
+
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+
+    ports:
+      - "8083:8083"
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # SeaweedFS
+  # ============================================================
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    container_name: cdc-seaweedfs
+
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: secret123
+
+    command: >
+      server
+      -dir=/data
+      -s3
+      -s3.port=8333
+
+    ports:
+      - "9333:9333"
+      - "8333:8333"
+
+    volumes:
+      - seaweedfs_data:/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -f http://localhost:9333/cluster/healthz || exit 1"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # SeaweedFS Initialization
+  # ============================================================
+
+  seaweedfs-init:
+    image: python:3.10-slim
+    container_name: cdc-seaweedfs-init
+
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+
+    command:
+      - sh
+      - -c
+      - |
+        pip install --no-cache-dir boto3
+
+        python <<'PY'
+        import boto3
+        import time
+
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="http://seaweedfs:8333",
+            aws_access_key_id="admin",
+            aws_secret_access_key="secret123",
+            region_name="us-east-1"
+        )
+
+        print("Waiting for SeaweedFS S3...")
+
+        for i in range(30):
+            try:
+                s3.list_buckets()
+                print("SeaweedFS S3 is ready!")
+                break
+            except Exception as e:
+                print(f"Attempt {i + 1}/30 failed: {e}")
+                time.sleep(2)
+        else:
+            raise RuntimeError(
+                "SeaweedFS S3 did not become ready"
+            )
+
+        bucket = "warehouse"
+
+        response = s3.list_buckets()
+
+        existing_buckets = [
+            b["Name"]
+            for b in response.get("Buckets", [])
+        ]
+
+        print("Existing buckets:", existing_buckets)
+
+        if bucket not in existing_buckets:
+            s3.create_bucket(Bucket=bucket)
+            print(f"Bucket '{bucket}' created successfully!")
+        else:
+            print(f"Bucket '{bucket}' already exists.")
+
+        print("SeaweedFS initialization completed.")
+        PY
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # Spark
+  # ============================================================
+
+  spark:
+    image: spark:3.5.7-scala2.12-java17-python3-ubuntu
+    container_name: cdc-spark
+
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "4040:4040"
+
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs
+
+    command: >
+      /opt/spark/bin/spark-class
+      org.apache.spark.deploy.master.Master
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # Airflow Metadata DB
+  # ============================================================
+
+  airflow-db:
+    image: postgres:15
+    container_name: cdc-airflow-db
+
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # Airflow
+  # ============================================================
+
+  airflow:
+    image: apache/airflow:2.10.5-python3.10
+    container_name: cdc-airflow
+
+    depends_on:
+      - airflow-db
+
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >
+        postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+
+      AIRFLOW__API__AUTH_BACKENDS: >
+        airflow.api.auth.backend.basic_auth,
+        airflow.api.auth.backend.session
+
+    ports:
+      - "8081:8080"
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/plugins:/opt/airflow/plugins
+
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow users create
+      --username admin
+      --password admin
+      --firstname Admin
+      --lastname User
+      --role Admin
+      --email admin@example.com || true &&
+      airflow webserver
+      "
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # Trino
+  # ============================================================
+  trino:
+    image: trinodb/trino:latest
+    container_name: cdc-trino
+    depends_on:
+      nessie:
+        condition: service_started
+      seaweedfs-init:
+        condition: service_completed_successfully
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./trino/etc/catalog:/etc/trino/catalog
+    networks:
+      - lakehouse
+
+  # ============================================================
+  # Prometheus
+  # ============================================================
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cdc-prometheus
+
+    ports:
+      - "9090:9090"
+
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # Grafana
+  # ============================================================
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cdc-grafana
+
+    ports:
+      - "3000:3000"
+
+    depends_on:
+      - prometheus
+
+    volumes:
+      - grafana_data:/var/lib/grafana
+
+    networks:
+      - lakehouse
+
+
+  # ============================================================
+  # PROJECT NESSIE
+  # ============================================================
+
+  nessie:
+    image: projectnessie/nessie:0.76.6
+    container_name: cdc-nessie
+
+    environment:
+      QUARKUS_HTTP_PORT: 19120
+
+      NESSIE_VERSION_STORE_TYPE: IN_MEMORY
+
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://warehouse/iceberg/
+
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://seaweedfs:8333
+
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: admin
+
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_SECRET_KEY: secret123
+
+    ports:
+      - "19120:19120"
+
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+
+    networks:
+      - lakehouse
+
+
+# ============================================================
+# Volumes
+# ============================================================
+
+volumes:
+  postgres_data:
+  airflow_db_data:
+  seaweedfs_data:
+  grafana_data:
+
+
+# ============================================================
+# Network
+# ============================================================
+
+networks:
+  lakehouse:
+    driver: bridge
